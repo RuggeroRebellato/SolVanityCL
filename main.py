@@ -8,12 +8,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from math import ceil
-from multiprocessing.pool import Pool
 
 import pyopencl as cl
 
 os.environ["PYOPENCL_COMPILER_OUTPUT"] = "1"
 os.environ["PYOPENCL_NO_CACHE"] = "TRUE"
+
 from pathlib import Path
 
 import click
@@ -22,7 +22,6 @@ from base58 import b58decode, b58encode
 from nacl.signing import SigningKey
 
 logging.basicConfig(level="INFO", format="[%(levelname)s %(asctime)s] %(message)s")
-
 
 class HostSetting:
     def __init__(self, kernel_source: str, iteration_bits: int) -> None:
@@ -55,7 +54,6 @@ class HostSetting:
 
         self.key32[:] = new_key32
 
-
 def check_character(name: str, character: str):
     try:
         b58decode(character)
@@ -64,7 +62,6 @@ def check_character(name: str, character: str):
         sys.exit(1)
     except Exception as e:
         raise e
-
 
 def get_kernel_source(starts_with: str, ends_with: str, cl):
     PREFIX_BYTES = list(bytes(starts_with.encode()))
@@ -93,17 +90,32 @@ def get_kernel_source(starts_with: str, ends_with: str, cl):
 
     return source_str
 
-
 def get_all_gpu_devices():
-    devices = [
-        device
-        for platform in cl.get_platforms()
-        for device in platform.get_devices(device_type=cl.device_type.GPU)
-    ]
-    return [d.int_ptr for d in devices]
+    try:
+        platforms = cl.get_platforms()
+        logging.info(f"Found platforms: {platforms}")
+        devices = []
+        for platform in platforms:
+            platform_devices = platform.get_devices(device_type=cl.device_type.GPU)
+            logging.info(f"Found devices on platform {platform.name}: {platform_devices}")
+            devices.extend(platform_devices)
+        return devices
+    except cl.LogicError as e:
+        logging.error(f"Error fetching GPU devices: {e}")
+        return []
+    except Exception as e:
+        logging.exception(f"Unexpected error: {e}")
+        return []
 
+def single_gpu_init(setting):
+    devices = get_all_gpu_devices()
+    if len(devices) == 0:
+        logging.error("No GPU devices found")
+        sys.exit(1)
 
-def single_gpu_init(context, setting):
+    device = devices[0]
+    context = cl.Context([device])
+
     searcher = Searcher(
         kernel_source=setting.kernel_source,
         index=0,
@@ -111,22 +123,6 @@ def single_gpu_init(context, setting):
         context=context,
     )
     return [searcher.find()]
-
-
-def multi_gpu_init(index: int, setting: HostSetting):
-    # get all platforms and devices
-    try:
-        searcher = Searcher(
-            kernel_source=setting.kernel_source,
-            index=index,
-            setting=setting,
-        )
-
-        return searcher.find()
-    except Exception as e:
-        logging.exception(e)
-    return [0]
-
 
 def save_result(outputs, output_dir):
     result_count = 0
@@ -146,22 +142,11 @@ def save_result(outputs, output_dir):
         )
     return result_count
 
-
 class Searcher:
     def __init__(
         self, *, kernel_source, index: int, setting: HostSetting, context=None
     ):
-
-        device_ids = get_all_gpu_devices()
-        # context and command queue
-        if context:
-            self.context = context
-            self.gpu_chunks = 1
-        else:
-            self.context = cl.Context(
-                [cl.Device.from_int_ptr(device_ids[index])],
-            )
-            self.gpu_chunks = len(device_ids)
+        self.context = context
         self.command_queue = cl.CommandQueue(self.context)
 
         self.setting = setting
@@ -208,7 +193,7 @@ class Searcher:
         self.kernel.set_arg(3, memobj_group_offset)
 
         st = time.time()
-        global_worker_size = self.setting.global_work_size // self.gpu_chunks
+        global_worker_size = self.setting.global_work_size
         cl.enqueue_nd_range_kernel(
             self.command_queue,
             self.kernel,
@@ -222,11 +207,9 @@ class Searcher:
 
         return output
 
-
 @click.group()
 def cli():
     pass
-
 
 @cli.command(context_settings={"show_default": True})
 @click.option(
@@ -288,8 +271,12 @@ def search_pubkey(
     logging.info(
         f"Searching Solana pubkey that starts with '{starts_with}' and ends with '{ends_with}'"
     )
-    with Pool() as pool:
-        gpu_counts = len(pool.apply(get_all_gpu_devices))
+
+    devices = get_all_gpu_devices()
+    gpu_counts = len(devices)
+    if gpu_counts == 0:
+        logging.error("No GPU devices found")
+        sys.exit(1)
 
     kernel_source = get_kernel_source(starts_with, ends_with, cl)
     setting = HostSetting(kernel_source, iteration_bits)
@@ -307,15 +294,11 @@ def search_pubkey(
                 time.sleep(0.1)
         return
 
-    with Pool(processes=gpu_counts) as pool:
-        while result_count < count:
-            results = pool.starmap(
-                multi_gpu_init, [(x, setting) for x in range(gpu_counts)]
-            )
-            result_count += save_result(results, output_dir)
-            setting.increase_key32()
-            time.sleep(0.1)
-
+    while result_count < count:
+        result = single_gpu_init(setting)
+        result_count += save_result(result, output_dir)
+        setting.increase_key32()
+        time.sleep(0.1)
 
 @cli.command(context_settings={"show_default": True})
 def show_device():
@@ -330,7 +313,6 @@ def show_device():
 
         for d_index, device in enumerate(devices):
             print(f"- Device {d_index}: {device.name}")
-
 
 if __name__ == "__main__":
     cli()
